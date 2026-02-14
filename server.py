@@ -176,16 +176,16 @@ async def _fetch_bets(
 ) -> list[tuple[int, float]]:
     """Fetch bet history and extract (timestamp_ms, probAfter) pairs before cutoff."""
     prob_points = []
-    cursor = None
+    after_id = None
 
     while True:
-        params = {"contractId": contract_id, "limit": 1000, "sorts": "asc"}
-        if cursor:
-            params["before"] = cursor
+        params = {"contractId": contract_id, "limit": 1000, "order": "asc"}
+        if after_id:
+            params["after"] = after_id
 
         response = await fetch_with_retry(client, f"{BASE_URL}/v0/bets", params=params)
         bets = response.json()
-        if not bets:
+        if not bets or not isinstance(bets, list):
             break
 
         for bet in bets:
@@ -198,7 +198,7 @@ async def _fetch_bets(
 
         if len(bets) < 1000:
             break
-        cursor = bets[-1].get("id")
+        after_id = bets[-1].get("id")
 
     return prob_points
 
@@ -239,25 +239,40 @@ def _format_market_summary(market: dict, cutoff_date: str) -> str:
     outcome_type = market.get("outcomeType", "BINARY")
     lines.append(f"Type: {outcome_type}")
 
+    backtesting = _is_backtesting(cutoff_date)
+
     # Probability for binary markets
+    # CRITICAL: API probability is CURRENT, not historical. Hide when backtesting.
     if outcome_type == "BINARY":
-        prob = market.get("probability")
-        if prob is not None:
-            lines.append(f"Probability: {prob * 100:.1f}%")
+        if backtesting:
+            lines.append("Probability: N/A (use manifold_get_market for historical probability)")
+        else:
+            prob = market.get("probability")
+            if prob is not None:
+                lines.append(f"Probability: {prob * 100:.1f}%")
 
     # Multiple choice answers
+    # CRITICAL: Answer probabilities are CURRENT, not historical. Hide when backtesting.
     if outcome_type == "MULTIPLE_CHOICE":
         answers = market.get("answers", [])
         if answers:
-            lines.append(f"Options ({len(answers)}):")
-            # Sort by probability descending
-            sorted_answers = sorted(answers, key=lambda a: a.get("probability", 0), reverse=True)
-            for ans in sorted_answers[:10]:
-                prob = ans.get("probability", 0)
-                text = ans.get("text", "Unknown")
-                lines.append(f"  {text}: {prob * 100:.1f}%")
-            if len(answers) > 10:
-                lines.append(f"  ... and {len(answers) - 10} more options")
+            if backtesting:
+                lines.append(f"Options ({len(answers)}):")
+                for ans in answers[:10]:
+                    text = ans.get("text", "Unknown")
+                    lines.append(f"  {text}: N/A")
+                if len(answers) > 10:
+                    lines.append(f"  ... and {len(answers) - 10} more options")
+                lines.append("  (use manifold_get_market for historical probabilities)")
+            else:
+                lines.append(f"Options ({len(answers)}):")
+                sorted_answers = sorted(answers, key=lambda a: a.get("probability", 0), reverse=True)
+                for ans in sorted_answers[:10]:
+                    prob = ans.get("probability", 0)
+                    text = ans.get("text", "Unknown")
+                    lines.append(f"  {text}: {prob * 100:.1f}%")
+                if len(answers) > 10:
+                    lines.append(f"  ... and {len(answers) - 10} more options")
 
     # Status
     is_resolved = market.get("isResolved", False)
@@ -308,23 +323,39 @@ def _format_market_detail(
     lines.append(f"Type: {outcome_type}")
 
     cutoff_ms = _get_cutoff_timestamp_ms(cutoff_date)
+    backtesting = _is_backtesting(cutoff_date)
 
-    # Current probability
+    # Probability for binary markets
+    # CRITICAL: API probability is CURRENT. When backtesting, use last bet prob instead.
     if outcome_type == "BINARY":
-        prob = market.get("probability")
-        if prob is not None:
-            lines.append(f"Probability: {prob * 100:.1f}%")
+        if backtesting and prob_history:
+            # Use last probability from bet history (already filtered to before cutoff)
+            last_prob = prob_history[-1][1]
+            lines.append(f"Probability (as of {cutoff_date}): {last_prob * 100:.1f}%")
+        elif backtesting:
+            lines.append("Probability: N/A (no historical bet data available)")
+        else:
+            prob = market.get("probability")
+            if prob is not None:
+                lines.append(f"Probability: {prob * 100:.1f}%")
 
     # Multiple choice
+    # CRITICAL: Answer probabilities are CURRENT. Hide when backtesting.
     if outcome_type == "MULTIPLE_CHOICE":
         answers = market.get("answers", [])
         if answers:
-            sorted_answers = sorted(answers, key=lambda a: a.get("probability", 0), reverse=True)
-            lines.append(f"Options ({len(answers)}):")
-            for ans in sorted_answers:
-                prob = ans.get("probability", 0)
-                text = ans.get("text", "Unknown")
-                lines.append(f"  {text}: {prob * 100:.1f}%")
+            if backtesting:
+                lines.append(f"Options ({len(answers)}):")
+                for ans in answers:
+                    text = ans.get("text", "Unknown")
+                    lines.append(f"  {text}: N/A (historical probabilities not available)")
+            else:
+                sorted_answers = sorted(answers, key=lambda a: a.get("probability", 0), reverse=True)
+                lines.append(f"Options ({len(answers)}):")
+                for ans in sorted_answers:
+                    prob = ans.get("probability", 0)
+                    text = ans.get("text", "Unknown")
+                    lines.append(f"  {text}: {prob * 100:.1f}%")
 
     # Resolution status
     is_resolved = market.get("isResolved", False)
@@ -529,11 +560,17 @@ async def manifold_get_market(
     client = get_async_client()
     cutoff_ms = _get_cutoff_timestamp_ms(cutoff_date)
 
-    # Fetch market
-    if slug:
-        response = await fetch_with_retry(client, f"{BASE_URL}/v0/slug/{slug}")
-    else:
-        response = await fetch_with_retry(client, f"{BASE_URL}/v0/market/{market_id}")
+    # Fetch market (handle 404 gracefully)
+    try:
+        if slug:
+            response = await fetch_with_retry(client, f"{BASE_URL}/v0/slug/{slug}")
+        else:
+            response = await fetch_with_retry(client, f"{BASE_URL}/v0/market/{market_id}")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            identifier = slug or market_id
+            return f"No market found with {'slug' if slug else 'ID'} '{identifier}'."
+        raise
 
     market = response.json()
     if not market or not market.get("id"):

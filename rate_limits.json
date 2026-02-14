@@ -1,0 +1,7 @@
+{
+  "max_requests_per_second": 8,
+  "hard_limit": "500/min (~8.3/s)",
+  "max_wait_seconds": 120,
+  "tools": {},
+  "notes": "Manifold Markets API rate limit is 500 requests/minute/IP. Set conservative limit of 8 req/s."
+}

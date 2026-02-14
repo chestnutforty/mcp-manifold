@@ -174,7 +174,7 @@ def _sample_probability_history(prob_points: list[tuple[int, float]], max_points
 async def _fetch_bets(
     client: httpx.AsyncClient, contract_id: str, cutoff_ms: int
 ) -> list[tuple[int, float]]:
-    """Fetch bet history and extract (timestamp_ms, probAfter) pairs before cutoff."""
+    """Fetch full bet history and extract (timestamp_ms, probAfter) pairs before cutoff."""
     prob_points = []
     after_id = None
 
@@ -203,6 +203,57 @@ async def _fetch_bets(
     return prob_points
 
 
+async def _fetch_bets_for_search(
+    client: httpx.AsyncClient, contract_id: str, cutoff_ms: int, window_ms: int
+) -> list[tuple[int, float]]:
+    """Fetch bet history for search results - returns points within window before cutoff.
+
+    Uses ascending order and pages through all bets up to cutoff, keeping only
+    points within the window. Stops at cutoff or after max_pages to limit cost.
+    """
+    prob_points = []
+    window_start = cutoff_ms - window_ms
+    last_point_before_window: tuple[int, float] | None = None
+    after_id = None
+
+    for _ in range(10):  # max 10 pages = 10k bets
+        params = {"contractId": contract_id, "limit": 1000, "order": "asc"}
+        if after_id:
+            params["after"] = after_id
+
+        try:
+            response = await fetch_with_retry(client, f"{BASE_URL}/v0/bets", params=params)
+        except Exception:
+            break
+        bets = response.json()
+        if not bets or not isinstance(bets, list):
+            break
+
+        for bet in bets:
+            ts = bet.get("createdTime", 0)
+            if ts >= cutoff_ms:
+                # Past cutoff, return what we have
+                # Include one point before window for trend calculation
+                if last_point_before_window and (not prob_points or prob_points[0][0] > window_start):
+                    prob_points.insert(0, last_point_before_window)
+                return prob_points
+            prob_after = bet.get("probAfter")
+            if prob_after is not None:
+                if ts >= window_start:
+                    prob_points.append((ts, prob_after))
+                else:
+                    last_point_before_window = (ts, prob_after)
+
+        if len(bets) < 1000:
+            break
+        after_id = bets[-1].get("id")
+
+    # Include one point before window for trend
+    if last_point_before_window and (not prob_points or prob_points[0][0] > window_start):
+        prob_points.insert(0, last_point_before_window)
+    return prob_points
+
+
 async def _fetch_comments(
     client: httpx.AsyncClient, contract_id: str, cutoff_ms: int
 ) -> list[dict]:
@@ -222,7 +273,9 @@ async def _fetch_comments(
     return filtered[:20]
 
 
-def _format_market_summary(market: dict, cutoff_date: str) -> str:
+def _format_market_summary(
+    market: dict, cutoff_date: str, recent_history: list[tuple[int, float]] | None = None
+) -> str:
     """Format a market into a concise summary line for search results."""
     lines = []
     question = market.get("question", "Unknown")
@@ -242,10 +295,21 @@ def _format_market_summary(market: dict, cutoff_date: str) -> str:
     backtesting = _is_backtesting(cutoff_date)
 
     # Probability for binary markets
-    # CRITICAL: API probability is CURRENT, not historical. Hide when backtesting.
+    # CRITICAL: API probability is CURRENT, not historical. Use bet history when backtesting.
     if outcome_type == "BINARY":
         if backtesting:
-            lines.append("Probability: N/A (use manifold_get_market for historical probability)")
+            if recent_history:
+                current_prob = recent_history[-1][1]
+                lines.append(f"Probability (as of {cutoff_date}): {current_prob * 100:.1f}%")
+                # Show trend
+                if len(recent_history) >= 2:
+                    start_prob = recent_history[0][1]
+                    delta = current_prob - start_prob
+                    sign = "+" if delta >= 0 else ""
+                    days_span = (recent_history[-1][0] - recent_history[0][0]) / (1000 * 86400)
+                    lines.append(f"  Trend ({int(days_span)}d): {sign}{delta*100:.1f}pp ({start_prob*100:.1f}% -> {current_prob*100:.1f}%)")
+            else:
+                lines.append("Probability: N/A (no bet history available)")
         else:
             prob = market.get("probability")
             if prob is not None:
@@ -446,10 +510,11 @@ def _extract_tiptap_text(node: dict) -> str:
     name="manifold_search_markets",
     title="Search Manifold Markets",
     description="""Search for prediction markets on Manifold Markets by text query.
-Returns market metadata including questions, probabilities, and status.
+Returns market metadata including questions, probabilities, and recent trend.
 
-Results include market slugs - use these with manifold_get_market to get detailed
-probability history and community comments.""",
+When backtesting, fetches recent bet history for each binary market to show the
+probability at cutoff and trend over the last N days. Results include market
+slugs - use these with manifold_get_market for full probability history and comments.""",
     meta={
         "when_to_use": """
 Use to find prediction markets on Manifold related to a topic. After finding
@@ -474,6 +539,7 @@ async def manifold_search_markets(
     limit: Annotated[int | None, "Maximum results to return (default 20)"] = 20,
     sort: Annotated[str | None, "Sort order: 'score' (relevance), 'newest', 'liquidity' (default 'score')"] = "score",
     filter_: Annotated[str | None, "Filter: 'all', 'open', 'closed', 'resolved' (default 'all')"] = "all",
+    history_days: Annotated[int | None, "Days of probability history to show in results (default 30)"] = 30,
     cutoff_date: Annotated[str, "YYYY-MM-DD format"] = datetime.now().strftime("%Y-%m-%d"),
 ) -> str:
     client = get_async_client()
@@ -498,7 +564,8 @@ async def manifold_search_markets(
             filtered.append(m)
 
     # Hide resolution for markets resolved after cutoff (backtesting)
-    if _is_backtesting(cutoff_date):
+    backtesting = _is_backtesting(cutoff_date)
+    if backtesting:
         for m in filtered:
             resolution_time = m.get("resolutionTime")
             if resolution_time and resolution_time >= cutoff_ms:
@@ -509,9 +576,25 @@ async def manifold_search_markets(
     if not filtered:
         return f"No markets found matching '{query}'."
 
+    # Fetch recent bet history for binary markets when backtesting
+    history_map: dict[str, list[tuple[int, float]]] = {}
+    if backtesting:
+        window_ms = (history_days or 30) * 86400 * 1000
+        binary_markets = [m for m in filtered if m.get("outcomeType") == "BINARY"]
+        if binary_markets:
+            tasks = [
+                _fetch_bets_for_search(client, m["id"], cutoff_ms, window_ms)
+                for m in binary_markets
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for m, result in zip(binary_markets, results):
+                if not isinstance(result, BaseException) and result:
+                    history_map[m["id"]] = result
+
     lines = [f"Search results for: {query}", f"Found {len(filtered)} markets", ""]
     for m in filtered:
-        lines.append(_format_market_summary(m, cutoff_date))
+        recent = history_map.get(m.get("id", ""))
+        lines.append(_format_market_summary(m, cutoff_date, recent_history=recent))
         lines.append("-" * 40)
 
     return "\n".join(lines)

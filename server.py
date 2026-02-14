@@ -450,9 +450,6 @@ def _format_market_detail(
     # Description
     text_desc = market.get("textDescription", "")
     if text_desc:
-        # Truncate very long descriptions
-        if len(text_desc) > 2000:
-            text_desc = text_desc[:2000] + "..."
         lines.append(f"\nDescription:\n{text_desc}")
 
     # Probability history
@@ -484,9 +481,6 @@ def _format_market_detail(
                 content = _extract_tiptap_text(content)
             if not content:
                 continue
-            # Truncate long comments
-            if len(content) > 500:
-                content = content[:500] + "..."
             date_str = _ts_ms_to_date(ts) if ts else ""
             lines.append(f"\n[{user} - {date_str}]")
             lines.append(content)

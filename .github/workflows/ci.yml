@@ -9,7 +9,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
       issues: write
@@ -64,7 +64,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          claude -p --dangerously-skip-permissions --model claude-haiku-4-5 --max-budget-usd 1 "
+          claude -p --dangerously-skip-permissions --model claude-sonnet-4-6 --max-turns 50 --max-budget-usd 1 "
           Test the MCP server at http://localhost:8000/mcp. Be concise.
 
           1. Read server.py to find all @mcp.tool definitions and which have cutoff_date params

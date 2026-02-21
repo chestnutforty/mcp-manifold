@@ -64,29 +64,56 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          claude -p --dangerously-skip-permissions --model claude-sonnet-4-6 --max-turns 50 --max-budget-usd 1 "
-          Test the MCP server at http://localhost:8000/mcp. Be concise.
+          set +e
+          timeout --signal=TERM --kill-after=30s 1200 \
+            claude -p --dangerously-skip-permissions --model claude-sonnet-4-6 --max-turns 50 --max-budget-usd 1 "
+            Test the MCP server at http://localhost:8000/mcp. Be concise.
 
-          1. Read server.py to find all @mcp.tool definitions and which have cutoff_date params
-          2. Write and run a Python script that:
-             - Connects: from fastmcp import Client; from fastmcp.client.transports import StreamableHttpTransport; client = Client(StreamableHttpTransport(url='http://localhost:8000/mcp'))
-             - Lists tools and prints count
-             - Calls each tool with simple valid inputs, verifies non-empty response
-             - For tools with cutoff_date: picks a random date 1-5 months ago, calls with that cutoff_date, and checks response has no info from after that date
-          3. Print summary: tool name, PASS/FAIL, reason for failures
-          4. If any failures: exit 1
-          "
+            1. Read server.py to find all @mcp.tool definitions and which have cutoff_date params
+            2. Write and run a Python script that:
+               - Connects: from fastmcp import Client; from fastmcp.client.transports import StreamableHttpTransport; client = Client(StreamableHttpTransport(url='http://localhost:8000/mcp'))
+               - Lists tools and prints count
+               - Calls each tool with simple valid inputs, verifies non-empty response
+               - For tools with cutoff_date: picks a random date 1-5 months ago, calls with that cutoff_date, and checks response has no info from after that date
+            3. Print summary: tool name, PASS/FAIL, reason for failures
+            4. If any failures: exit 1
+            " 2>&1 | tee /tmp/claude-output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ $EXIT_CODE -eq 124 ]; then
+            echo "CLAUDE_ERROR=Timed out after 20 minutes" >> "$GITHUB_ENV"
+          elif [ $EXIT_CODE -ne 0 ]; then
+            echo "CLAUDE_ERROR=Exited with code $EXIT_CODE" >> "$GITHUB_ENV"
+          fi
+          exit $EXIT_CODE
 
       - name: Notify failure via Slack
-        if: failure()
+        if: failure() || cancelled()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
           REPO="${{ github.repository }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          CLAUDE_LOG=""
+          if [ -f /tmp/claude-output.txt ]; then
+            CLAUDE_LOG=$(tail -80 /tmp/claude-output.txt | head -c 2800)
+          fi
+          CLAUDE_LOG_JSON=$(python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" <<< "$CLAUDE_LOG")
+          ERROR_MSG="${CLAUDE_ERROR:-Unknown error}"
           curl -sf "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' \
-            -d "{\"text\":\"CI failed for ${REPO}\",\"blocks\":[{\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\"CI Failed\"}},{\"type\":\"section\",\"fields\":[{\"type\":\"mrkdwn\",\"text\":\"*Repo:*\n${REPO}\"},{\"type\":\"mrkdwn\",\"text\":\"*Run:*\n<${RUN_URL}|View logs>\"}]}]}"
+            -d "$(python3 -c "
+          import json
+          blocks = [
+            {'type':'header','text':{'type':'plain_text','text':'CI Failed'}},
+            {'type':'section','fields':[
+              {'type':'mrkdwn','text':'*Repo:*\n$REPO'},
+              {'type':'mrkdwn','text':'*Error:*\n$ERROR_MSG'}
+            ]},
+            {'type':'section','text':{'type':'mrkdwn','text':'*Run:* <$RUN_URL|View logs>'}},
+            {'type':'section','text':{'type':'mrkdwn','text':'*Claude output (last 80 lines):*\n\`\`\`' + json.loads($CLAUDE_LOG_JSON)[:2800] + '\`\`\`'}}
+          ]
+          print(json.dumps({'text':'CI failed for $REPO','blocks':blocks}))
+          ")"
 
   build-and-push:
     needs: test

@@ -3,6 +3,8 @@
 Provides tools for forecasting agents with full backtesting support.
 Access prediction market data including market details, community probability
 history, and comments with proper cutoff date handling.
+
+Uses the manifold-sdk for all API interactions.
 """
 
 import asyncio
@@ -15,19 +17,34 @@ from typing import Annotated
 import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from manifold_sdk import AsyncClient, NotFoundError
+from manifold_sdk.types import Comment, Market, ProbabilityPoint
 
 load_dotenv()
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 MCP_NAME = "manifold"
 
-BASE_URL = "https://api.manifold.markets"
+# Proxy support - Manifold API is unauthenticated, rate-limits by IP
+def _build_proxy_url() -> str | None:
+    username = os.getenv("OXYLABS_USERNAME")
+    password = os.getenv("OXYLABS_PASSWORD")
+    if not username or not password:
+        return None
+    return f"http://{username}:{password}@pr.oxylabs.io:7777"
 
-# Concurrency control
-MAX_CONCURRENCY = 10
-_async_client: httpx.AsyncClient | None = None
-_semaphore: asyncio.Semaphore | None = None
-_semaphore_loop: asyncio.AbstractEventLoop | None = None
+PROXY_URL = _build_proxy_url()
+
+# SDK client - lazily initialized per event loop
+_sdk_client: AsyncClient | None = None
+
+
+def _get_sdk_client() -> AsyncClient:
+    """Get or create the SDK async client."""
+    global _sdk_client
+    if _sdk_client is None:
+        _sdk_client = AsyncClient(proxy=PROXY_URL, timeout=30.0)
+    return _sdk_client
 
 
 def send_slack_error(
@@ -76,47 +93,6 @@ def notify_on_error(func):
     return wrapper
 
 
-def get_async_client() -> httpx.AsyncClient:
-    global _async_client
-    if _async_client is None:
-        _async_client = httpx.AsyncClient(timeout=30.0)
-    return _async_client
-
-
-def get_semaphore() -> asyncio.Semaphore:
-    global _semaphore, _semaphore_loop
-    try:
-        current_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        current_loop = None
-    if _semaphore is None or _semaphore_loop is not current_loop:
-        _semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-        _semaphore_loop = current_loop
-    return _semaphore
-
-
-async def fetch_with_retry(
-    client: httpx.AsyncClient,
-    url: str,
-    params: dict | None = None,
-    max_retries: int = 3,
-    base_delay: float = 0.5,
-) -> httpx.Response:
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            async with get_semaphore():
-                response = await client.get(url, params=params)
-                response.raise_for_status()
-                return response
-        except (httpx.HTTPStatusError, httpx.RequestError) as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-    raise last_error
-
-
 mcp = FastMCP(
     name="manifold",
     instructions=r"""
@@ -133,6 +109,11 @@ forecasting.
 - Multiple choice outcomes with individual probabilities
 """.strip(),
 )
+
+
+# =============================================================================
+# HELPERS (kept from original)
+# =============================================================================
 
 
 def _is_backtesting(cutoff_date: str) -> bool:
@@ -156,6 +137,16 @@ def _ts_ms_to_datetime(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
+def _dt_to_date(dt: datetime) -> str:
+    """Convert a datetime to YYYY-MM-DD string."""
+    return dt.strftime("%Y-%m-%d")
+
+
+def _dt_to_ms(dt: datetime) -> int:
+    """Convert a datetime to Unix ms."""
+    return int(dt.timestamp() * 1000)
+
+
 def _sample_probability_history(prob_points: list[tuple[int, float]], max_points: int = 50) -> list[tuple[int, float]]:
     """Downsample probability history to at most max_points evenly spaced entries."""
     if len(prob_points) <= max_points:
@@ -171,132 +162,74 @@ def _sample_probability_history(prob_points: list[tuple[int, float]], max_points
     return sampled
 
 
-async def _fetch_bets(
-    client: httpx.AsyncClient, contract_id: str, cutoff_ms: int
+def _extract_tiptap_text(node: dict) -> str:
+    """Extract plain text from TipTap JSON content."""
+    if not isinstance(node, dict):
+        return str(node) if node else ""
+    texts = []
+    if node.get("type") == "text":
+        texts.append(node.get("text", ""))
+    for child in node.get("content", []):
+        texts.append(_extract_tiptap_text(child))
+    return " ".join(t for t in texts if t).strip()
+
+
+def _prob_points_to_tuples(points: list[ProbabilityPoint]) -> list[tuple[int, float]]:
+    """Convert SDK ProbabilityPoint list to (timestamp_ms, probability) tuples."""
+    return [(_dt_to_ms(p.timestamp), p.probability) for p in points]
+
+
+def _window_prob_history(
+    points: list[tuple[int, float]], cutoff_ms: int, window_ms: int
 ) -> list[tuple[int, float]]:
-    """Fetch full bet history and extract (timestamp_ms, probAfter) pairs before cutoff."""
-    prob_points = []
-    after_id = None
+    """Window probability points to only include those within window before cutoff.
 
-    while True:
-        params = {"contractId": contract_id, "limit": 1000, "order": "asc"}
-        if after_id:
-            params["after"] = after_id
-
-        response = await fetch_with_retry(client, f"{BASE_URL}/v0/bets", params=params)
-        bets = response.json()
-        if not bets or not isinstance(bets, list):
-            break
-
-        for bet in bets:
-            ts = bet.get("createdTime", 0)
-            if ts >= cutoff_ms:
-                return prob_points
-            prob_after = bet.get("probAfter")
-            if prob_after is not None:
-                prob_points.append((ts, prob_after))
-
-        if len(bets) < 1000:
-            break
-        after_id = bets[-1].get("id")
-
-    return prob_points
-
-
-async def _fetch_bets_for_search(
-    client: httpx.AsyncClient, contract_id: str, cutoff_ms: int, window_ms: int
-) -> list[tuple[int, float]]:
-    """Fetch bet history for search results - returns points within window before cutoff.
-
-    Uses ascending order and pages through all bets up to cutoff, keeping only
-    points within the window. Stops at cutoff or after max_pages to limit cost.
+    Returns points in [cutoff_ms - window_ms, cutoff_ms) with one additional
+    point just before the window start for trend calculation.
     """
-    prob_points = []
     window_start = cutoff_ms - window_ms
-    last_point_before_window: tuple[int, float] | None = None
-    after_id = None
+    in_window = []
+    last_before_window: tuple[int, float] | None = None
 
-    for _ in range(10):  # max 10 pages = 10k bets
-        params = {"contractId": contract_id, "limit": 1000, "order": "asc"}
-        if after_id:
-            params["after"] = after_id
-
-        try:
-            response = await fetch_with_retry(client, f"{BASE_URL}/v0/bets", params=params)
-        except Exception:
+    for ts, prob in points:
+        if ts >= cutoff_ms:
             break
-        bets = response.json()
-        if not bets or not isinstance(bets, list):
-            break
-
-        for bet in bets:
-            ts = bet.get("createdTime", 0)
-            if ts >= cutoff_ms:
-                # Past cutoff, return what we have
-                # Include one point before window for trend calculation
-                if last_point_before_window and (not prob_points or prob_points[0][0] > window_start):
-                    prob_points.insert(0, last_point_before_window)
-                return prob_points
-            prob_after = bet.get("probAfter")
-            if prob_after is not None:
-                if ts >= window_start:
-                    prob_points.append((ts, prob_after))
-                else:
-                    last_point_before_window = (ts, prob_after)
-
-        if len(bets) < 1000:
-            break
-        after_id = bets[-1].get("id")
+        if ts >= window_start:
+            in_window.append((ts, prob))
+        else:
+            last_before_window = (ts, prob)
 
     # Include one point before window for trend
-    if last_point_before_window and (not prob_points or prob_points[0][0] > window_start):
-        prob_points.insert(0, last_point_before_window)
-    return prob_points
+    if last_before_window and (not in_window or in_window[0][0] > window_start):
+        in_window.insert(0, last_before_window)
+    return in_window
 
 
-async def _fetch_comments(
-    client: httpx.AsyncClient, contract_id: str, cutoff_ms: int
-) -> list[dict]:
-    """Fetch comments for a market before cutoff date."""
-    params = {"contractId": contract_id}
-    response = await fetch_with_retry(client, f"{BASE_URL}/v0/comments", params=params)
-    all_comments = response.json() or []
-
-    filtered = []
-    for c in all_comments:
-        ts = c.get("createdTime", 0)
-        if ts < cutoff_ms:
-            filtered.append(c)
-
-    # Sort by time, return most recent 20
-    filtered.sort(key=lambda x: x.get("createdTime", 0), reverse=True)
-    return filtered[:20]
+# =============================================================================
+# FORMATTING (adapted from original to work with SDK models)
+# =============================================================================
 
 
 def _format_market_summary(
-    market: dict, cutoff_date: str, recent_history: list[tuple[int, float]] | None = None
+    market: Market, cutoff_date: str, recent_history: list[tuple[int, float]] | None = None
 ) -> str:
     """Format a market into a concise summary line for search results."""
     lines = []
-    question = market.get("question", "Unknown")
-    lines.append(f"Question: {question}")
+    lines.append(f"Question: {market.question}")
 
-    slug = market.get("slug", "")
-    if slug:
-        lines.append(f"Slug: {slug} (use with manifold_get_market)")
+    if market.slug:
+        lines.append(f"Slug: {market.slug} (use with manifold_get_market)")
 
-    market_id = market.get("id", "")
-    if market_id:
-        lines.append(f"ID: {market_id}")
+    if market.id:
+        lines.append(f"ID: {market.id}")
 
-    outcome_type = market.get("outcomeType", "BINARY")
-    lines.append(f"Type: {outcome_type}")
+    lines.append(f"Type: {market.outcome_type}")
 
     backtesting = _is_backtesting(cutoff_date)
 
     # Probability for binary markets
     # CRITICAL: API probability is CURRENT, not historical. Use bet history when backtesting.
-    if outcome_type == "BINARY":
+    if market.outcome_type == "BINARY":
         if backtesting:
             if recent_history:
                 current_prob = recent_history[-1][1]
@@ -311,144 +244,117 @@ def _format_market_summary(
             else:
                 lines.append("Probability: N/A (no bet history available)")
         else:
-            prob = market.get("probability")
-            if prob is not None:
-                lines.append(f"Probability: {prob * 100:.1f}%")
+            if market.probability is not None:
+                lines.append(f"Probability: {market.probability * 100:.1f}%")
 
     # Multiple choice answers
     # CRITICAL: Answer probabilities are CURRENT, not historical. Hide when backtesting.
-    if outcome_type == "MULTIPLE_CHOICE":
-        answers = market.get("answers", [])
+    if market.outcome_type == "MULTIPLE_CHOICE":
+        answers = market.answers or []
         if answers:
             if backtesting:
                 lines.append(f"Options ({len(answers)}):")
                 for ans in answers[:10]:
-                    text = ans.get("text", "Unknown")
-                    lines.append(f"  {text}: N/A")
+                    lines.append(f"  {ans.text}: N/A")
                 if len(answers) > 10:
                     lines.append(f"  ... and {len(answers) - 10} more options")
                 lines.append("  (use manifold_get_market for historical probabilities)")
             else:
                 lines.append(f"Options ({len(answers)}):")
-                sorted_answers = sorted(answers, key=lambda a: a.get("probability", 0), reverse=True)
+                sorted_answers = sorted(answers, key=lambda a: a.probability or 0, reverse=True)
                 for ans in sorted_answers[:10]:
-                    prob = ans.get("probability", 0)
-                    text = ans.get("text", "Unknown")
-                    lines.append(f"  {text}: {prob * 100:.1f}%")
+                    prob = ans.probability or 0
+                    lines.append(f"  {ans.text}: {prob * 100:.1f}%")
                 if len(answers) > 10:
                     lines.append(f"  ... and {len(answers) - 10} more options")
 
     # Status
-    is_resolved = market.get("isResolved", False)
     cutoff_ms = _get_cutoff_timestamp_ms(cutoff_date)
-    resolution_time = market.get("resolutionTime")
 
-    if is_resolved and resolution_time and resolution_time < cutoff_ms:
-        resolution = market.get("resolution", "")
-        lines.append(f"Status: RESOLVED ({resolution})")
-    elif is_resolved and resolution_time and resolution_time >= cutoff_ms and _is_backtesting(cutoff_date):
+    if market.is_resolved and market.resolution_time and _dt_to_ms(market.resolution_time) < cutoff_ms:
+        lines.append(f"Status: RESOLVED ({market.resolution})")
+    elif market.is_resolved and market.resolution_time and _dt_to_ms(market.resolution_time) >= cutoff_ms and backtesting:
         lines.append("Status: Open (as of cutoff)")
     else:
-        close_time = market.get("closeTime")
-        if close_time:
-            lines.append(f"Closes: {_ts_ms_to_date(close_time)}")
+        if market.close_time:
+            lines.append(f"Closes: {_dt_to_date(market.close_time)}")
         lines.append("Status: Open")
 
     # Created date
-    created = market.get("createdTime")
-    if created:
-        lines.append(f"Created: {_ts_ms_to_date(created)}")
+    lines.append(f"Created: {_dt_to_date(market.created_time)}")
 
     # Volume (only when not backtesting)
-    if not _is_backtesting(cutoff_date):
-        volume = market.get("volume")
-        if volume:
-            lines.append(f"Volume: {volume:,.0f} mana")
+    if not backtesting:
+        if market.volume:
+            lines.append(f"Volume: {market.volume:,.0f} mana")
 
     return "\n".join(lines)
 
 
 def _format_market_detail(
-    market: dict,
+    market: Market,
     prob_history: list[tuple[int, float]] | None,
-    comments: list[dict] | None,
+    comments: list[Comment] | None,
     cutoff_date: str,
 ) -> str:
     """Format full market details including probability history and comments."""
     lines = []
-    question = market.get("question", "Unknown")
-    lines.append(f"Question: {question}")
-
-    slug = market.get("slug", "")
-    market_id = market.get("id", "")
-    outcome_type = market.get("outcomeType", "BINARY")
-    lines.append(f"ID: {market_id}")
-    lines.append(f"Slug: {slug}")
-    lines.append(f"Type: {outcome_type}")
+    lines.append(f"Question: {market.question}")
+    lines.append(f"ID: {market.id}")
+    lines.append(f"Slug: {market.slug}")
+    lines.append(f"Type: {market.outcome_type}")
 
     cutoff_ms = _get_cutoff_timestamp_ms(cutoff_date)
     backtesting = _is_backtesting(cutoff_date)
 
     # Probability for binary markets
     # CRITICAL: API probability is CURRENT. When backtesting, use last bet prob instead.
-    if outcome_type == "BINARY":
+    if market.outcome_type == "BINARY":
         if backtesting and prob_history:
-            # Use last probability from bet history (already filtered to before cutoff)
             last_prob = prob_history[-1][1]
             lines.append(f"Probability (as of {cutoff_date}): {last_prob * 100:.1f}%")
         elif backtesting:
             lines.append("Probability: N/A (no historical bet data available)")
         else:
-            prob = market.get("probability")
-            if prob is not None:
-                lines.append(f"Probability: {prob * 100:.1f}%")
+            if market.probability is not None:
+                lines.append(f"Probability: {market.probability * 100:.1f}%")
 
     # Multiple choice
     # CRITICAL: Answer probabilities are CURRENT. Hide when backtesting.
-    if outcome_type == "MULTIPLE_CHOICE":
-        answers = market.get("answers", [])
+    if market.outcome_type == "MULTIPLE_CHOICE":
+        answers = market.answers or []
         if answers:
             if backtesting:
                 lines.append(f"Options ({len(answers)}):")
                 for ans in answers:
-                    text = ans.get("text", "Unknown")
-                    lines.append(f"  {text}: N/A (historical probabilities not available)")
+                    lines.append(f"  {ans.text}: N/A (historical probabilities not available)")
             else:
-                sorted_answers = sorted(answers, key=lambda a: a.get("probability", 0), reverse=True)
+                sorted_answers = sorted(answers, key=lambda a: a.probability or 0, reverse=True)
                 lines.append(f"Options ({len(answers)}):")
                 for ans in sorted_answers:
-                    prob = ans.get("probability", 0)
-                    text = ans.get("text", "Unknown")
-                    lines.append(f"  {text}: {prob * 100:.1f}%")
+                    prob = ans.probability or 0
+                    lines.append(f"  {ans.text}: {prob * 100:.1f}%")
 
     # Resolution status
-    is_resolved = market.get("isResolved", False)
-    resolution_time = market.get("resolutionTime")
-
-    if is_resolved and resolution_time and resolution_time < cutoff_ms:
-        resolution = market.get("resolution", "")
-        lines.append(f"Status: RESOLVED ({resolution})")
-        lines.append(f"Resolved: {_ts_ms_to_date(resolution_time)}")
-    elif is_resolved and _is_backtesting(cutoff_date):
+    if market.is_resolved and market.resolution_time and _dt_to_ms(market.resolution_time) < cutoff_ms:
+        lines.append(f"Status: RESOLVED ({market.resolution})")
+        lines.append(f"Resolved: {_dt_to_date(market.resolution_time)}")
+    elif market.is_resolved and backtesting:
         lines.append("Status: Open (as of cutoff; resolution hidden)")
     else:
-        close_time = market.get("closeTime")
-        if close_time:
-            lines.append(f"Closes: {_ts_ms_to_date(close_time)}")
+        if market.close_time:
+            lines.append(f"Closes: {_dt_to_date(market.close_time)}")
 
     # Dates
-    created = market.get("createdTime")
-    if created:
-        lines.append(f"Created: {_ts_ms_to_date(created)}")
+    lines.append(f"Created: {_dt_to_date(market.created_time)}")
 
     # Volume (only when not backtesting)
-    if not _is_backtesting(cutoff_date):
-        volume = market.get("volume")
-        if volume:
-            lines.append(f"Volume: {volume:,.0f} mana")
+    if not backtesting:
+        if market.volume:
+            lines.append(f"Volume: {market.volume:,.0f} mana")
 
     # Description
-    text_desc = market.get("textDescription", "")
+    text_desc = market.get_description_text()
     if text_desc:
         lines.append(f"\nDescription:\n{text_desc}")
 
@@ -473,31 +379,20 @@ def _format_market_detail(
     if comments:
         lines.append(f"\n=== Community Comments ({len(comments)} most recent) ===")
         for c in comments:
-            user = c.get("userName", "Unknown")
-            ts = c.get("createdTime", 0)
-            content = c.get("content", c.get("text", ""))
-            # Extract text from TipTap JSON content if needed
-            if isinstance(content, dict):
-                content = _extract_tiptap_text(content)
+            user = c.user_name
+            content = c.get_text()
             if not content:
                 continue
-            date_str = _ts_ms_to_date(ts) if ts else ""
+            date_str = _dt_to_date(c.created_time)
             lines.append(f"\n[{user} - {date_str}]")
             lines.append(content)
 
     return "\n".join(lines)
 
 
-def _extract_tiptap_text(node: dict) -> str:
-    """Extract plain text from TipTap JSON content."""
-    if not isinstance(node, dict):
-        return str(node) if node else ""
-    texts = []
-    if node.get("type") == "text":
-        texts.append(node.get("text", ""))
-    for child in node.get("content", []):
-        texts.append(_extract_tiptap_text(child))
-    return " ".join(t for t in texts if t).strip()
+# =============================================================================
+# TOOLS
+# =============================================================================
 
 
 @mcp.tool(
@@ -536,58 +431,46 @@ async def manifold_search_markets(
     history_days: Annotated[int | None, "Days of probability history to show in results (default 30)"] = 30,
     cutoff_date: Annotated[str, "YYYY-MM-DD format"] = datetime.now().strftime("%Y-%m-%d"),
 ) -> str:
-    client = get_async_client()
+    sdk_client = _get_sdk_client()
     cutoff_ms = _get_cutoff_timestamp_ms(cutoff_date)
 
-    params = {
-        "term": query,
-        "limit": min(limit or 20, 50),
-        "sort": sort or "score",
-    }
-    if filter_ and filter_ != "all":
-        params["filter"] = filter_
-
-    response = await fetch_with_retry(client, f"{BASE_URL}/v0/search-markets", params=params)
-    markets = response.json() or []
-
-    # Filter: only markets that existed before cutoff
-    filtered = []
-    for m in markets:
-        created = m.get("createdTime", 0)
-        if created < cutoff_ms:
-            filtered.append(m)
-
-    # Hide resolution for markets resolved after cutoff (backtesting)
-    backtesting = _is_backtesting(cutoff_date)
-    if backtesting:
-        for m in filtered:
-            resolution_time = m.get("resolutionTime")
-            if resolution_time and resolution_time >= cutoff_ms:
-                m.pop("resolution", None)
-                m.pop("resolutionTime", None)
-                m["isResolved"] = False
+    # SDK handles search + cutoff_date filtering (creation time + resolution masking)
+    market_list = await sdk_client.markets.search(
+        query,
+        limit=limit or 20,
+        sort=sort or "score",
+        filter=filter_ if filter_ and filter_ != "all" else None,
+        cutoff_date=cutoff_date,
+    )
+    filtered = market_list.items
 
     if not filtered:
         return f"No markets found matching '{query}'."
 
     # Fetch recent bet history for binary markets when backtesting
+    backtesting = _is_backtesting(cutoff_date)
     history_map: dict[str, list[tuple[int, float]]] = {}
     if backtesting:
         window_ms = (history_days or 30) * 86400 * 1000
-        binary_markets = [m for m in filtered if m.get("outcomeType") == "BINARY"]
+        binary_markets = [m for m in filtered if m.outcome_type == "BINARY"]
         if binary_markets:
             tasks = [
-                _fetch_bets_for_search(client, m["id"], cutoff_ms, window_ms)
+                sdk_client.bets.get_probability_history(
+                    contract_id=m.id, cutoff_date=cutoff_date
+                )
                 for m in binary_markets
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for m, result in zip(binary_markets, results):
-                if not isinstance(result, BaseException) and result:
-                    history_map[m["id"]] = result
+                if not isinstance(result, BaseException) and result.points:
+                    all_points = _prob_points_to_tuples(result.points)
+                    windowed = _window_prob_history(all_points, cutoff_ms, window_ms)
+                    if windowed:
+                        history_map[m.id] = windowed
 
     lines = [f"Search results for: {query}", f"Found {len(filtered)} markets", ""]
     for m in filtered:
-        recent = history_map.get(m.get("id", ""))
+        recent = history_map.get(m.id)
         lines.append(_format_market_summary(m, cutoff_date, recent_history=recent))
         lines.append("-" * 40)
 
@@ -634,68 +517,57 @@ async def manifold_get_market(
     if not slug and not market_id:
         return "Please provide either a slug or market_id."
 
-    client = get_async_client()
+    sdk_client = _get_sdk_client()
     cutoff_ms = _get_cutoff_timestamp_ms(cutoff_date)
 
-    # Fetch market (handle 404 gracefully)
+    # Fetch market via SDK (handles 404 -> NotFoundError, resolution masking)
     try:
-        if slug:
-            response = await fetch_with_retry(client, f"{BASE_URL}/v0/slug/{slug}")
-        else:
-            response = await fetch_with_retry(client, f"{BASE_URL}/v0/market/{market_id}")
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            identifier = slug or market_id
-            return f"No market found with {'slug' if slug else 'ID'} '{identifier}'."
-        raise
-
-    market = response.json()
-    if not market or not market.get("id"):
+        market = await sdk_client.markets.get(
+            slug=slug, market_id=market_id, cutoff_date=cutoff_date
+        )
+    except NotFoundError:
         identifier = slug or market_id
         return f"No market found with {'slug' if slug else 'ID'} '{identifier}'."
 
     # Check if market existed before cutoff
-    created = market.get("createdTime", 0)
-    if created >= cutoff_ms:
-        return f"Market did not exist as of {cutoff_date} (created {_ts_ms_to_date(created)})."
-
-    contract_id = market["id"]
-
-    # Hide resolution if after cutoff (backtesting)
-    if _is_backtesting(cutoff_date):
-        resolution_time = market.get("resolutionTime")
-        if resolution_time and resolution_time >= cutoff_ms:
-            market.pop("resolution", None)
-            market.pop("resolutionTime", None)
-            market["isResolved"] = False
+    created_ms = _dt_to_ms(market.created_time)
+    if created_ms >= cutoff_ms:
+        return f"Market did not exist as of {cutoff_date} (created {_dt_to_date(market.created_time)})."
 
     # Fetch probability history and comments concurrently
-    prob_history = None
-    comments = None
+    prob_history: list[tuple[int, float]] | None = None
+    comments: list[Comment] | None = None
 
     tasks = []
-    if include_history and market.get("outcomeType") == "BINARY":
-        tasks.append(_fetch_bets(client, contract_id, cutoff_ms))
-    else:
-        tasks.append(asyncio.coroutine(lambda: None)() if False else asyncio.sleep(0))
-
+    fetch_history = include_history and market.outcome_type == "BINARY"
+    if fetch_history:
+        tasks.append(
+            sdk_client.bets.get_probability_history(
+                contract_id=market.id, cutoff_date=cutoff_date
+            )
+        )
     if include_comments:
-        tasks.append(_fetch_comments(client, contract_id, cutoff_ms))
-    else:
-        tasks.append(asyncio.sleep(0))
+        tasks.append(
+            sdk_client.comments.list(
+                contract_id=market.id, cutoff_date=cutoff_date
+            )
+        )
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        idx = 0
 
-    if include_history and market.get("outcomeType") == "BINARY":
-        if not isinstance(results[0], BaseException):
-            prob_history = results[0]
+        if fetch_history:
+            if not isinstance(results[idx], BaseException):
+                history_result = results[idx]
+                prob_history = _prob_points_to_tuples(history_result.points)
+            idx += 1
 
-    if include_comments:
-        comment_idx = 1 if (include_history and market.get("outcomeType") == "BINARY") else 0
-        if comment_idx < len(results) and not isinstance(results[comment_idx], BaseException):
-            comments = results[comment_idx]
-            if not isinstance(comments, list):
-                comments = None
+        if include_comments:
+            if idx < len(results) and not isinstance(results[idx], BaseException):
+                comment_list = results[idx]
+                # SDK returns sorted newest first; limit to 20
+                comments = comment_list.items[:20] if comment_list.items else None
 
     return _format_market_detail(market, prob_history, comments, cutoff_date)
 

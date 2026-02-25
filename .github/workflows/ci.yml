@@ -46,6 +46,8 @@ jobs:
           "
 
       - name: Start MCP server
+        env:
+          MIDDLEWARE_CLIENT_ID: ${{ github.event.repository.name }}
         run: |
           uv run uvicorn app:app --port 8000 --host 0.0.0.0 &
           for i in $(seq 1 30); do
@@ -81,10 +83,16 @@ jobs:
           EXIT_CODE=${PIPESTATUS[0]}
           if [ $EXIT_CODE -eq 124 ]; then
             echo "CLAUDE_ERROR=Timed out after 20 minutes" >> "$GITHUB_ENV"
+            exit 1
           elif [ $EXIT_CODE -ne 0 ]; then
             echo "CLAUDE_ERROR=Exited with code $EXIT_CODE" >> "$GITHUB_ENV"
+            exit 1
           fi
-          exit $EXIT_CODE
+          # Fail if Claude hit max turns or budget without completing tests
+          if grep -qiE 'Reached max turns|max budget' /tmp/claude-output.txt; then
+            echo "CLAUDE_ERROR=Claude ran out of turns/budget before completing tests" >> "$GITHUB_ENV"
+            exit 1
+          fi
 
       - name: Notify failure via Slack
         if: failure() || cancelled()

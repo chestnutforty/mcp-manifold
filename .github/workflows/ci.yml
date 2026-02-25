@@ -48,6 +48,8 @@ jobs:
       - name: Start MCP server
         env:
           MIDDLEWARE_CLIENT_ID: ${{ github.event.repository.name }}
+          MIDDLEWARE_AUTH_SECRET: ${{ secrets.MIDDLEWARE_AUTH_SECRET }}
+          ENCLAVE_URL: ${{ secrets.ENCLAVE_URL }}
         run: |
           uv run uvicorn app:app --port 8000 --host 0.0.0.0 &
           for i in $(seq 1 30); do
@@ -66,9 +68,10 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          set +e
+          JSON_SCHEMA='{"type":"object","properties":{"all_passed":{"type":"boolean"},"report":{"type":"string"}},"required":["all_passed","report"]}'
           timeout --signal=TERM --kill-after=30s 1200 \
-            claude -p --dangerously-skip-permissions --model claude-haiku-4-5 --max-turns 50 --max-budget-usd 1 "
+            claude -p --dangerously-skip-permissions --model claude-haiku-4-5 --max-turns 50 --max-budget-usd 1 \
+              --output-format json --json-schema "$JSON_SCHEMA" "
             Test the MCP server at http://localhost:8000/mcp. Be concise.
 
             1. Read server.py to find all @mcp.tool definitions and which have cutoff_date params
@@ -78,21 +81,32 @@ jobs:
                - Calls each tool with simple valid inputs, verifies non-empty response
                - For tools with cutoff_date: picks a random date 1-5 months ago, calls with that cutoff_date, and checks response has no info from after that date
             3. Print summary: tool name, PASS/FAIL, reason for failures
-            4. If any failures: exit 1
-            " 2>&1 | tee /tmp/claude-output.txt
-          EXIT_CODE=${PIPESTATUS[0]}
-          if [ $EXIT_CODE -eq 124 ]; then
-            echo "CLAUDE_ERROR=Timed out after 20 minutes" >> "$GITHUB_ENV"
-            exit 1
-          elif [ $EXIT_CODE -ne 0 ]; then
-            echo "CLAUDE_ERROR=Exited with code $EXIT_CODE" >> "$GITHUB_ENV"
-            exit 1
-          fi
-          # Fail if Claude hit max turns or budget without completing tests
-          if grep -qiE 'Reached max turns|max budget' /tmp/claude-output.txt; then
-            echo "CLAUDE_ERROR=Claude ran out of turns/budget before completing tests" >> "$GITHUB_ENV"
+
+            Set all_passed=true only if every tool passed. Put the full test report in report.
+            " > /tmp/claude-result.json 2>/tmp/claude-stderr.txt
+          echo "Raw output:"
+          cat /tmp/claude-result.json
+
+      - name: Check test results
+        run: |
+          if [ ! -s /tmp/claude-result.json ]; then
+            echo "No output from Claude Code"
+            [ -f /tmp/claude-stderr.txt ] && cat /tmp/claude-stderr.txt
             exit 1
           fi
+          python3 -c "
+          import json, sys
+          with open('/tmp/claude-result.json') as f:
+              raw = json.load(f)
+          data = raw.get('structured_output') or raw.get('result') or raw
+          if isinstance(data, str):
+              data = json.loads(data)
+          print(data['report'])
+          with open('/tmp/claude-summary.txt', 'w') as f:
+              f.write(data['report'][:2800])
+          if not data['all_passed']:
+              sys.exit(1)
+          "
 
       - name: Notify failure via Slack
         if: failure() || cancelled()
@@ -102,12 +116,14 @@ jobs:
           if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
           REPO="${{ github.repository }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          CLAUDE_LOG=""
-          if [ -f /tmp/claude-output.txt ]; then
-            CLAUDE_LOG=$(tail -80 /tmp/claude-output.txt | head -c 2800)
+          if [ -f /tmp/claude-summary.txt ]; then
+            SUMMARY=$(cat /tmp/claude-summary.txt)
+          elif [ -f /tmp/claude-stderr.txt ]; then
+            SUMMARY=$(tail -20 /tmp/claude-stderr.txt | head -c 2800)
+          else
+            SUMMARY="No test output (server may have failed to start)"
           fi
-          CLAUDE_LOG_JSON=$(python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" <<< "$CLAUDE_LOG")
-          ERROR_MSG="${CLAUDE_ERROR:-Unknown error}"
+          SUMMARY_JSON=$(python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" <<< "$SUMMARY")
           curl -sf "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' \
             -d "$(python3 -c "
           import json
@@ -115,10 +131,9 @@ jobs:
             {'type':'header','text':{'type':'plain_text','text':'CI Failed'}},
             {'type':'section','fields':[
               {'type':'mrkdwn','text':'*Repo:*\n$REPO'},
-              {'type':'mrkdwn','text':'*Error:*\n$ERROR_MSG'}
+              {'type':'mrkdwn','text':'*Summary:*\n' + json.loads($SUMMARY_JSON)[:2800]}
             ]},
-            {'type':'section','text':{'type':'mrkdwn','text':'*Run:* <$RUN_URL|View logs>'}},
-            {'type':'section','text':{'type':'mrkdwn','text':'*Claude output (last 80 lines):*\n\`\`\`' + json.loads($CLAUDE_LOG_JSON)[:2800] + '\`\`\`'}}
+            {'type':'section','text':{'type':'mrkdwn','text':'*Run:* <$RUN_URL|View logs>'}}
           ]
           print(json.dumps({'text':'CI failed for $REPO','blocks':blocks}))
           ")"

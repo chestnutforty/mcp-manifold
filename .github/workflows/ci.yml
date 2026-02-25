@@ -70,7 +70,7 @@ jobs:
         run: |
           JSON_SCHEMA='{"type":"object","properties":{"all_passed":{"type":"boolean"},"report":{"type":"string"}},"required":["all_passed","report"]}'
           timeout --signal=TERM --kill-after=30s 1200 \
-            claude -p --dangerously-skip-permissions --model claude-haiku-4-5 --max-turns 50 --max-budget-usd 1 \
+            claude -p --dangerously-skip-permissions --model claude-haiku-4-5 --max-turns 100 --max-budget-usd 1 \
               --output-format json --json-schema "$JSON_SCHEMA" "
             Test the MCP server at http://localhost:8000/mcp. Be concise.
 
@@ -98,6 +98,14 @@ jobs:
           import json, sys
           with open('/tmp/claude-result.json') as f:
               raw = json.load(f)
+          # Handle error cases (max_turns, timeout, etc.)
+          subtype = raw.get('subtype', '')
+          if subtype.startswith('error') or raw.get('is_error'):
+              msg = f\"Claude Code failed: {subtype or 'unknown error'}\"
+              print(msg)
+              with open('/tmp/claude-summary.txt', 'w') as f:
+                  f.write(msg)
+              sys.exit(1)
           data = raw.get('structured_output') or raw.get('result') or raw
           if isinstance(data, str):
               data = json.loads(data)

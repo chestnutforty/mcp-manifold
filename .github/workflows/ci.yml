@@ -19,7 +19,7 @@ jobs:
       - name: Configure git for private repos
         run: git config --global url."https://x-access-token:${{ secrets.PRIVATE_DEPS_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v7
         with:
           version: "latest"
 
@@ -66,7 +66,7 @@ jobs:
         run: |
           set +e
           timeout --signal=TERM --kill-after=30s 1200 \
-            claude -p --dangerously-skip-permissions --model claude-sonnet-4-6 --max-turns 50 --max-budget-usd 1 "
+            claude -p --dangerously-skip-permissions --model claude-haiku-4-5 --max-turns 50 --max-budget-usd 1 "
             Test the MCP server at http://localhost:8000/mcp. Be concise.
 
             1. Read server.py to find all @mcp.tool definitions and which have cutoff_date params

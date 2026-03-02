@@ -8,32 +8,15 @@ Uses the manifold-sdk for all API interactions.
 """
 
 import asyncio
-import os
-import traceback
 from datetime import datetime, timezone
-from functools import wraps
 from typing import Annotated
 
-import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from manifold_sdk import AsyncClient, NotFoundError
 from manifold_sdk.types import Comment, Market, ProbabilityPoint
 
 load_dotenv()
-
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-MCP_NAME = "manifold"
-
-# Proxy support - Manifold API is unauthenticated, rate-limits by IP
-def _build_proxy_url() -> str | None:
-    username = os.getenv("OXYLABS_USERNAME")
-    password = os.getenv("OXYLABS_PASSWORD")
-    if not username or not password:
-        return None
-    return f"http://{username}:{password}@pr.oxylabs.io:7777"
-
-PROXY_URL = _build_proxy_url()
 
 # SDK client - lazily initialized per event loop
 _sdk_client: AsyncClient | None = None
@@ -43,54 +26,8 @@ def _get_sdk_client() -> AsyncClient:
     """Get or create the SDK async client."""
     global _sdk_client
     if _sdk_client is None:
-        _sdk_client = AsyncClient(proxy=PROXY_URL, timeout=30.0)
+        _sdk_client = AsyncClient(timeout=30.0)
     return _sdk_client
-
-
-def send_slack_error(
-    tool_name: str, error: Exception, args: tuple, kwargs: dict
-) -> None:
-    if not SLACK_WEBHOOK_URL:
-        return
-    try:
-        error_message = {
-            "text": f"MCP Tool Error in `{MCP_NAME}`",
-            "blocks": [
-                {
-                    "type": "header",
-                    "text": {"type": "plain_text", "text": "MCP Tool Error", "emoji": True},
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {"type": "mrkdwn", "text": f"*MCP Server:*\n{MCP_NAME}"},
-                        {"type": "mrkdwn", "text": f"*Tool:*\n{tool_name}"},
-                    ],
-                },
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*Error:*\n```{str(error)[:500]}```"},
-                },
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*Traceback:*\n```{traceback.format_exc()[:1000]}```"},
-                },
-            ],
-        }
-        httpx.post(SLACK_WEBHOOK_URL, json=error_message, timeout=5)
-    except Exception:
-        pass
-
-
-def notify_on_error(func):
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            send_slack_error(func.__name__, e, args, kwargs)
-            raise
-    return wrapper
 
 
 mcp = FastMCP(
@@ -422,7 +359,6 @@ Forecast: "Who will win the next UK election?"
     tags={"backtesting_supported", "output:medium", "format:list"},
     exclude_args=["cutoff_date"],
 )
-@notify_on_error
 async def manifold_search_markets(
     query: Annotated[str, "Search text (e.g., 'AI risk', 'election 2028', 'bitcoin')"],
     limit: Annotated[int | None, "Maximum results to return (default 20)"] = 20,
@@ -506,7 +442,6 @@ Manifold URLs: manifold.markets/username/market-slug
     tags={"backtesting_supported", "output:high", "format:structured"},
     exclude_args=["cutoff_date"],
 )
-@notify_on_error
 async def manifold_get_market(
     slug: Annotated[str | None, "Market slug from search results or Manifold URL"] = None,
     market_id: Annotated[str | None, "Market ID (alternative to slug)"] = None,

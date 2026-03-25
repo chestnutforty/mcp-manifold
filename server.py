@@ -390,12 +390,18 @@ async def manifold_search_markets(
         window_ms = (history_days or 30) * 86400 * 1000
         binary_markets = [m for m in filtered if m.outcome_type == "BINARY"]
         if binary_markets:
-            tasks = [
-                sdk_client.bets.get_probability_history(
-                    contract_id=m.id, cutoff_date=cutoff_date
-                )
-                for m in binary_markets
-            ]
+            async def _fetch_history(market_id: str) -> object:
+                try:
+                    return await asyncio.wait_for(
+                        sdk_client.bets.get_probability_history(
+                            contract_id=market_id, cutoff_date=cutoff_date
+                        ),
+                        timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    return TimeoutError(f"History fetch timed out for {market_id}")
+
+            tasks = [_fetch_history(m.id) for m in binary_markets]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for m, result in zip(binary_markets, results):
                 if not isinstance(result, BaseException) and result.points:

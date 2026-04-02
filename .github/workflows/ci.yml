@@ -92,29 +92,65 @@ jobs:
           if [ ! -s /tmp/claude-result.json ]; then
             echo "No output from Claude Code"
             [ -f /tmp/claude-stderr.txt ] && cat /tmp/claude-stderr.txt
+            echo "FAILED: No test output" > /tmp/claude-summary.txt
             exit 1
           fi
-          python3 -c "
-          import json, sys
+          python3 << 'PYEOF'
+          import json, sys, re
+
           with open('/tmp/claude-result.json') as f:
               raw = json.load(f)
-          # Handle error cases (max_turns, timeout, etc.)
+
           subtype = raw.get('subtype', '')
-          if subtype.startswith('error') or raw.get('is_error'):
-              msg = f\"Claude Code failed: {subtype or 'unknown error'}\"
+          if raw.get('is_error'):
+              msg = f"Claude Code error: {raw.get('result', subtype or 'unknown')}"
               print(msg)
+              with open('/tmp/claude-summary.txt', 'w') as f:
+                  f.write(msg[:2800])
+              sys.exit(1)
+
+          data = None
+          for key in ('structured_output', 'result'):
+              candidate = raw.get(key)
+              if candidate is None:
+                  continue
+              if isinstance(candidate, dict) and 'all_passed' in candidate:
+                  data = candidate
+                  break
+              if isinstance(candidate, str):
+                  try:
+                      parsed = json.loads(candidate)
+                      if isinstance(parsed, dict) and 'all_passed' in parsed:
+                          data = parsed
+                          break
+                  except (json.JSONDecodeError, TypeError):
+                      continue
+
+          if data is None:
+              result_text = raw.get('result', '')
+              if isinstance(result_text, str):
+                  m = re.search(r'\{[^{}]*"all_passed"\s*:\s*(true|false)[^{}]*\}', result_text)
+                  if m:
+                      try:
+                          data = json.loads(m.group(0))
+                      except (json.JSONDecodeError, TypeError):
+                          pass
+
+          if data is None:
+              msg = f"Could not parse test results (subtype={subtype})"
+              print(msg)
+              print(f"Result preview: {str(raw.get('result', ''))[:500]}")
               with open('/tmp/claude-summary.txt', 'w') as f:
                   f.write(msg)
               sys.exit(1)
-          data = raw.get('structured_output') or raw.get('result') or raw
-          if isinstance(data, str):
-              data = json.loads(data)
-          print(data['report'])
+
+          report = data.get('report', 'No report text')
+          print(report)
           with open('/tmp/claude-summary.txt', 'w') as f:
-              f.write(data['report'][:2800])
-          if not data['all_passed']:
+              f.write(report[:2800])
+          if not data.get('all_passed', False):
               sys.exit(1)
-          "
+          PYEOF
 
       - name: Notify failure via Slack
         if: failure() || cancelled()

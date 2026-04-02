@@ -16,6 +16,18 @@ from fastmcp import FastMCP
 from manifold_sdk import AsyncClient, NotFoundError
 from manifold_sdk.types import Comment, Market, ProbabilityPoint
 
+def _resolve_cutoff_date(cutoff_date: str | None = None) -> str:
+    """Resolve cutoff_date: env var > parameter > today."""
+    import os
+    env = os.environ.get("CUTOFF_DATE", "").strip()
+    if env:
+        return env
+    if cutoff_date:
+        return cutoff_date
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+
 load_dotenv()
 
 # SDK client - lazily initialized per event loop
@@ -150,6 +162,7 @@ def _window_prob_history(
 def _format_market_summary(
     market: Market, cutoff_date: str, recent_history: list[tuple[int, float]] | None = None
 ) -> str:
+    cutoff_date = _resolve_cutoff_date(cutoff_date)
     """Format a market into a concise summary line for search results."""
     lines = []
     lines.append(f"Question: {market.question}")
@@ -365,7 +378,7 @@ async def manifold_search_markets(
     sort: Annotated[str | None, "Sort order: 'score' (relevance), 'newest', 'liquidity' (default 'score')"] = "score",
     filter_: Annotated[str | None, "Filter: 'all', 'open', 'closed', 'resolved' (default 'all')"] = "all",
     history_days: Annotated[int | None, "Days of probability history to show in results (default 30)"] = 30,
-    cutoff_date: Annotated[str, "YYYY-MM-DD format"] = datetime.now().strftime("%Y-%m-%d"),
+    cutoff_date: Annotated[str, "YYYY-MM-DD format"] = None,
 ) -> str:
     sdk_client = _get_sdk_client()
     cutoff_ms = _get_cutoff_timestamp_ms(cutoff_date)
@@ -453,7 +466,7 @@ async def manifold_get_market(
     market_id: Annotated[str | None, "Market ID (alternative to slug)"] = None,
     include_history: Annotated[bool, "Include probability history from bets (default true)"] = True,
     include_comments: Annotated[bool, "Include community comments (default true)"] = True,
-    cutoff_date: Annotated[str, "YYYY-MM-DD format"] = datetime.now().strftime("%Y-%m-%d"),
+    cutoff_date: Annotated[str, "YYYY-MM-DD format"] = None,
 ) -> str:
     if not slug and not market_id:
         return "Please provide either a slug or market_id."
